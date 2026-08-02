@@ -109,6 +109,14 @@ def offset_coordinate(lat, lon, azimuth_deg, distance_km):
                               math.cos(d) - math.sin(lat1) * math.sin(lat2))
     return math.degrees(lat2), math.degrees(lon2)
 
+def _haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
 # ── 方向性降雨: 反太陽方向に扇状サンプリング（±40° × 2〜8km）───
 RAIN_FAN_AZ    = (-40, -20, 0, 20, 40)
 RAIN_FAN_DIST  = (2, 4, 6, 8)
@@ -345,11 +353,26 @@ def notify_nearby_devices(max_score, sun_az):
     body  = f'スコア {max_score} — {rainbow_dir}の方角を見てみて'
 
     table    = boto3.resource('dynamodb').Table(DEVICES_TABLE)
-    response = table.scan(FilterExpression=Attr('region').eq(REGION_ID))
     sns      = boto3.client('sns')
     sent     = 0
 
-    for item in response.get('Items', []):
+    # 通知対象 = 直近の位置がこの地域の圏内(COVERAGE_KM)にある端末のみ。
+    # 選択中の地域タブ(region)ではなく実際の居場所で判定する。
+    # → 日本にいればハワイ等の遠方地域のLambdaからは通知が届かない。
+    items = []
+    resp  = table.scan()
+    items.extend(resp.get('Items', []))
+    while 'LastEvaluatedKey' in resp:
+        resp = table.scan(ExclusiveStartKey=resp['LastEvaluatedKey'])
+        items.extend(resp.get('Items', []))
+
+    for item in items:
+        try:
+            d_lat = float(item['lat']); d_lon = float(item['lon'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _haversine_km(d_lat, d_lon, CENTER_LAT, CENTER_LON) > COVERAGE_KM:
+            continue
         apns_payload = json.dumps({
             'aps': {
                 'alert': {'title': title, 'body': body},
