@@ -117,6 +117,13 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
+def _nearest_point_index(lat, lon):
+    lat_per_km = 1.0 / 111.0
+    lon_per_km = 1.0 / (111.0 * math.cos(math.radians(CENTER_LAT)))
+    i = max(-HALF_N, min(HALF_N, round((lat - CENTER_LAT) / (GRID_KM * lat_per_km))))
+    j = max(-HALF_N, min(HALF_N, round((lon - CENTER_LON) / (GRID_KM * lon_per_km))))
+    return (i + HALF_N) * (2 * HALF_N + 1) + (j + HALF_N)
+
 # ── 方向性降雨: 反太陽方向に扇状サンプリング（±40° × 2〜8km）───
 RAIN_FAN_AZ    = (-40, -20, 0, 20, 40)
 RAIN_FAN_DIST  = (2, 4, 6, 8)
@@ -344,21 +351,34 @@ def lookup_weather(weather_map, lat, lon):
     return weather_map[(i, j)]
 
 # ── Push 通知 ─────────────────────────────────────────────────
-def notify_nearby_devices(max_score, sun_az):
-    if max_score < 70 or not DEVICES_TABLE:
+def notify_nearby_devices(now, sun_az, live_scores, frames):
+    if not DEVICES_TABLE:
+        return 0
+
+    live_max = max(live_scores, default=0)
+    near_frames = []          # 次2時間以内の予報フレーム（Always の先読み用）
+    for fr in frames:
+        try:
+            fdt = datetime.fromisoformat(fr['time_utc']).replace(tzinfo=timezone.utc)
+        except (KeyError, ValueError):
+            continue
+        lead_s = (fdt - now).total_seconds()
+        if 0 < lead_s <= 7200 and fr.get('in_rainbow'):
+            near_frames.append((fr, lead_s))
+    fc_max = max((max(fr['scores'], default=0) for fr, _ in near_frames), default=0)
+
+    # フロア(Always=40)未満なら誰も対象にならない → 早期終了
+    if live_max < 40 and fc_max < 40:
         return 0
 
     rainbow_dir = CARD16_JA[round(((sun_az + 180) % 360) / 22.5) % 16]
-    title = '🌈 虹が出そうです！'
-    body  = f'スコア {max_score} — {rainbow_dir}の方角を見てみて'
+    phase = 'am' if sun_az < 180 else 'pm'
+    tag   = now.date().isoformat() + ':' + phase
 
-    table    = boto3.resource('dynamodb').Table(DEVICES_TABLE)
-    sns      = boto3.client('sns')
-    sent     = 0
+    table = boto3.resource('dynamodb').Table(DEVICES_TABLE)
+    sns   = boto3.client('sns')
+    sent  = 0
 
-    # 通知対象 = 直近の位置がこの地域の圏内(COVERAGE_KM)にある端末のみ。
-    # 選択中の地域タブ(region)ではなく実際の居場所で判定する。
-    # → 日本にいればハワイ等の遠方地域のLambdaからは通知が届かない。
     items = []
     resp  = table.scan()
     items.extend(resp.get('Items', []))
@@ -373,27 +393,52 @@ def notify_nearby_devices(max_score, sun_az):
             continue
         if _haversine_km(d_lat, d_lon, CENTER_LAT, CENTER_LON) > COVERAGE_KM:
             continue
-        apns_payload = json.dumps({
-            'aps': {
-                'alert': {'title': title, 'body': body},
-                'sound': 'default',
-            }
-        })
-        message = json.dumps({
-            'APNS':         apns_payload,
-            'APNS_SANDBOX': apns_payload,
-        })
+        if item.get('last_notified') == tag:      # 1フェーズ1回のクールダウン
+            continue
+
+        auth      = item.get('auth', 'wheninuse')
+        accuracy  = item.get('accuracy', 'reduced')
+        threshold = 40 if auth == 'always' else 70
+
+        if accuracy == 'full':
+            idx  = _nearest_point_index(d_lat, d_lon)
+            live = live_scores[idx] if idx < len(live_scores) else 0
+        else:
+            idx  = None
+            live = live_max
+
+        title = None
+        body  = None
+        if live >= threshold:
+            score = live
+            title = '🌈 虹が出そうです！'
+            body  = f'スコア {score} — {rainbow_dir}の方角を見てみて'
+        elif auth == 'always':
+            for fr, lead_s in near_frames:
+                fscore = fr['scores'][idx] if (idx is not None and idx < len(fr['scores'])) else max(fr['scores'], default=0)
+                if fscore >= threshold:
+                    lead = max(1, round(lead_s / 3600))
+                    title = '🌈 まもなく虹？'
+                    body  = f'約{lead}時間後に虹の可能性。方向: {rainbow_dir}'
+                    break
+
+        if title is None:
+            continue
+
+        apns_payload = json.dumps({'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'}})
+        message = json.dumps({'APNS': apns_payload, 'APNS_SANDBOX': apns_payload})
         try:
-            sns.publish(
-                TargetArn=item['endpoint_arn'],
-                Message=message,
-                MessageStructure='json',
+            sns.publish(TargetArn=item['endpoint_arn'], Message=message, MessageStructure='json')
+            table.update_item(
+                Key={'device_token': item['device_token']},
+                UpdateExpression='SET last_notified = :t',
+                ExpressionAttributeValues={':t': tag},
             )
             sent += 1
         except Exception as e:
             print(f'[PUSH ERROR] {e}')
 
-    print(f'[PUSH] sent={sent} max_score={max_score} dir={rainbow_dir}')
+    print(f'[PUSH] sent={sent} live_max={live_max} fc_max={fc_max}')
     return sent
 
 # ── Lambda エントリーポイント ─────────────────────────────────
@@ -468,11 +513,12 @@ def lambda_handler(event, context):
         'features':     features,
     }
     _upload(payload)
-    _build_and_upload_forecast(now, points, hourly_maps, hour_times)
+    frames = _build_and_upload_forecast(now, points, hourly_maps, hour_times)
 
     if in_rainbow_window:
-        max_score = max((f['properties']['score'] for f in features), default=0)
-        notify_nearby_devices(max_score, sun_az)
+        live_scores = [f['properties']['score'] for f in features]
+        max_score   = max(live_scores, default=0)
+        notify_nearby_devices(now, sun_az, live_scores, frames)
         print(f'[OK] {now.isoformat()} points={len(features)} max_score={max_score} sun_alt={sun_alt:.1f}°')
     else:
         print(f'[RAIN] {now.isoformat()} points={len(features)} sun_alt={sun_alt:.1f}° (rain display only)')
@@ -541,6 +587,7 @@ def _build_and_upload_forecast(now, points, hourly_maps, hour_times):
         ContentType='application/json', CacheControl='max-age=540',
     )
     print(f'[FORECAST] frames={len(frames)}')
+    return frames
 
 def _refresh_sightings_json():
     if not SIGHTINGS_TABLE:
